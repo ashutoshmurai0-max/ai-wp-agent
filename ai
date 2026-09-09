@@ -1,0 +1,229 @@
+import streamlit as st
+import pywhatkit as kit
+import datetime
+import time
+import threading
+import uuid
+import streamlit.components.v1 as components
+
+# 1. Page Configuration
+st.set_page_config(
+    page_title="WhatsApp AI Agent",
+    page_icon="🤖",
+    layout="centered",
+    initial_sidebar_state="expanded"
+)
+
+# --- Theme Toggle ---
+dark_mode = st.sidebar.toggle("🌙 Dark Mode", value=True)
+
+if dark_mode:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stAppViewContainer"] { background-color: #0E1117; color: #FAFAFA; }
+        [data-testid="stSidebar"] { background-color: #262730; }
+        [data-testid="stHeader"] { background-color: #0E1117; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# Session state सेटअप
+if 'scheduled_tasks' not in st.session_state:
+    st.session_state.scheduled_tasks = []
+
+
+# --- बैकएंड मैसेज फंक्शन (अब Live Edit सपोर्ट के साथ) ---
+def send_scheduled_message(task_data):
+    while True:
+        # अगर टास्क कैंसिल हो गया है तो रुक जाओ
+        if task_data["status"] == "Cancelled":
+            print(f"🛑 Task for {task_data['Target']} was cancelled!")
+            return
+
+        now = datetime.datetime.now()
+
+        # यह लूप डिक्शनरी के अंदर के लाइव 'target_dt' को चेक करता है
+        # अगर आपने UI से टाइम बदल दिया, तो ये अपने आप नए टाइम को मान लेगा!
+        if now >= task_data["target_dt"]:
+            break
+        time.sleep(1)
+
+    if task_data["status"] == "Cancelled":
+        return
+
+    task_data["status"] = "Running"
+    print(f"🚀 Sending message to {task_data['Target']}...")
+
+    try:
+        if task_data["is_group"]:
+            kit.sendwhatmsg_to_group_instantly(task_data["Target"], task_data["Message"], wait_time=15,
+                                               tab_close=task_data["auto_close"])
+        else:
+            kit.sendwhatmsg_instantly(task_data["Target"], task_data["Message"], wait_time=15,
+                                      tab_close=task_data["auto_close"])
+        task_data["status"] = "Completed"
+    except Exception as e:
+        print(f"❌ Error sending to {task_data['Target']}: {e}")
+        task_data["status"] = "Failed"
+
+
+# --- Live Timer Function ---
+def display_live_timer(target_iso, task_id):
+    html_code = f"""
+    <div id="timer_{task_id}" style="font-family: sans-serif; color: #ff4b4b; font-weight: bold; font-size: 14px; margin-bottom: 5px;"></div>
+    <script>
+        var target_{task_id} = new Date("{target_iso}").getTime();
+        var timerElement_{task_id} = document.getElementById("timer_{task_id}");
+
+        var x_{task_id} = setInterval(function() {{
+            var now = new Date().getTime();
+            var distance = target_{task_id} - now;
+
+            if (distance < 0) {{
+                clearInterval(x_{task_id});
+                timerElement_{task_id}.innerHTML = "🚀 Executing / Completed...";
+                timerElement_{task_id}.style.color = "#00cc66";
+            }} else {{
+                var h = Math.floor((distance % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+                var m = Math.floor((distance % (1000 * 60 * 60)) / (1000 * 60));
+                var s = Math.floor((distance % (1000 * 60)) / 1000);
+                timerElement_{task_id}.innerHTML = "⏳ Time left: " + h + "h " + m + "m " + s + "s";
+            }}
+        }}, 1000);
+    </script>
+    """
+    components.html(html_code, height=30)
+
+
+# पुरानी या कैंसिल हो चुकी टास्क को लिस्ट से हटाना
+st.session_state.scheduled_tasks = [t for t in st.session_state.scheduled_tasks if t["status"] == "Pending"]
+
+# --- Sidebar UI - Dashboard & Task Management ---
+with st.sidebar:
+    st.header("📊 Task Dashboard")
+
+    if len(st.session_state.scheduled_tasks) == 0:
+        st.info("No active tasks. 😴")
+    else:
+        st.metric(label="Active Tasks", value=len(st.session_state.scheduled_tasks))
+        st.markdown("---")
+
+        for task in st.session_state.scheduled_tasks:
+            with st.container(border=True):
+                st.write(f"**To:** {task['Target']}")
+                st.caption(f"📅 {task['Date'].strftime('%d %b, %Y')} | ⏰ {task['Time'].strftime('%I:%M %p')}")
+
+                # लाइव टाइमर
+                display_live_timer(task['ISO_Time'], task['ID'])
+
+                # --- नया फीचर: View & Edit Expander ---
+                with st.expander("👁️ View & ✏️ Edit"):
+                    new_msg = st.text_area("Edit Message:", value=task['Message'], key=f"msg_{task['ID']}", height=80)
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        new_date = st.date_input("Date", value=task['Date'], key=f"date_{task['ID']}")
+                    with c2:
+                        new_time = st.time_input("Time", value=task['Time'], key=f"time_{task['ID']}")
+
+                    # सेव बटन
+                    if st.button("💾 Save", key=f"save_{task['ID']}", use_container_width=True):
+                        task['Message'] = new_msg
+                        task['Date'] = new_date
+                        task['Time'] = new_time
+
+                        # नया टारगेट टाइम कैलकुलेट करके डिक्शनरी में अपडेट करना
+                        new_dt = datetime.datetime.combine(new_date, new_time)
+                        task['target_dt'] = new_dt
+                        task['ISO_Time'] = new_dt.isoformat()
+
+                        st.toast(f"✅ Task for {task['Target']} Updated!")
+                        st.rerun()  # UI और टाइमर को रिफ्रेश करने के लिए
+
+                # कैंसिल बटन
+                if st.button("❌ Cancel Task", key=f"cancel_{task['ID']}", use_container_width=True):
+                    task["status"] = "Cancelled"
+                    st.toast(f"🛑 Task for {task['Target']} Cancelled!")
+                    st.rerun()
+
+                # --- Main Page UI ---
+st.title("🤖 Universal AI Task Agent")
+st.markdown("Automate, multi-task, edit live tasks, and manage WhatsApp messages like a pro.")
+st.divider()
+
+with st.container(border=True):
+    st.subheader("1️⃣ Target Detail")
+    message_type = st.radio("Select Type:", ("Individual Number", "WhatsApp Group"), horizontal=True)
+
+    if message_type == "Individual Number":
+        target_id_input = st.text_input("📞 Target Phone Number(s):", placeholder="e.g., 9999999999, 8888888888")
+        st.caption("✨ **Tip:** Enter multiple numbers separated by commas. (+91 is auto-applied)")
+    else:
+        target_id_input = st.text_input("👥 Group Link Code(s):", placeholder="e.g., ABC, XYZ")
+        st.caption("✨ **Tip:** Enter multiple group codes separated by commas.")
+
+with st.container(border=True):
+    st.subheader("2️⃣ Message Content")
+    message_content = st.text_area("💬 Write your message below:", height=120)
+
+with st.container(border=True):
+    st.subheader("3️⃣ Time & Preferences")
+    col1, col2 = st.columns(2)
+    with col1:
+        send_date = st.date_input("📅 Date:", min_value=datetime.date.today())
+    with col2:
+        send_time = st.time_input("⏰ Time:")
+
+    auto_close_tab = st.checkbox("Auto-close WhatsApp tab after sending", value=False)
+
+# --- Activate Logic ---
+st.write("")
+if st.button("🚀 Activate Agent", type="primary", use_container_width=True):
+    if not target_id_input or not message_content:
+        st.error("⚠️ Please fill in all the details!")
+    else:
+        target_datetime = datetime.datetime.combine(send_date, send_time)
+
+        if target_datetime <= datetime.datetime.now():
+            st.error("❌ The selected time has already passed! Please choose a future time.")
+        else:
+            is_group = (message_type == "WhatsApp Group")
+            targets_list = [t.strip() for t in target_id_input.split(",") if t.strip()]
+
+            for t_id in targets_list:
+                final_target_id = t_id
+
+                # Auto +91 Prefix
+                if not is_group and not final_target_id.startswith("+"):
+                    final_target_id = "+91" + final_target_id
+
+                # --- नया: सारा डेटा एक ही डिक्शनरी में पैक करना ---
+                task_data = {
+                    "ID": str(uuid.uuid4()),
+                    "Target": final_target_id,
+                    "Message": message_content,
+                    "Date": send_date,
+                    "Time": send_time,
+                    "target_dt": target_datetime,
+                    "ISO_Time": target_datetime.isoformat(),
+                    "is_group": is_group,
+                    "auto_close": auto_close_tab,
+                    "status": "Pending"
+                }
+
+                # इसी डिक्शनरी को थ्रेड में भेजना
+                task_thread = threading.Thread(
+                    target=send_scheduled_message,
+                    args=(task_data,),
+                    daemon=True
+                )
+                task_thread.start()
+
+                # इसी डिक्शनरी को UI (Dashboard) के लिए सेव करना
+                st.session_state.scheduled_tasks.append(task_data)
+
+            st.success(f"✅ Tasks created for **{len(targets_list)} target(s)**!")
+            time.sleep(1)
+            st.rerun()
